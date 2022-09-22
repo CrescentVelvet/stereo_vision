@@ -1,4 +1,5 @@
 # NeRF神经辐射场
+import os
 import torch
 import numpy as np
 import configargparse
@@ -68,7 +69,7 @@ def train():
     print('>>>第一步,加载数据集',args.dataset_type)
     if args.dataset_type == 'blender': # 加载数据集blender
         images,poses,render_poses,hwf,i_split = load_data.load_blender_data(args.datadir,args.half_res,args.testskip)
-        print('加载数据集 blender',images.shape,render_poses.shape,hwf,args.datadir)
+        print('*数据集 blender 图像尺寸',images.shape,'渲染尺寸',render_poses.shape,'高宽中心',hwf,'目录',args.datadir)
         i_train,i_val,i_test = i_split
         near = 2.0
         far = 6.0
@@ -79,10 +80,29 @@ def train():
     else: # 数据集类型未知
         print('数据集类型未知',args.dataset_type)
         return
-
-    print('>>>第二步,加载数据集')
-    print('>>>第三步,加载数据集')
-    print('>>>第四步,加载数据集')
+    H,W,focal = hwf # 数据类型调整
+    H,W = int(H),int(W)
+    hwf = [H,W,focal] # 高宽中心数值取整数int
+    if K is None: # 重新获取hwf高宽中心数值
+        K = np.array([[focal,0,0.5*W],[0,focal,0.5*H],[0,0,1]])
+    if args.render_test: # 如果要测试,使用测试数据集
+        render_poses = np.array(poses[i_test])
+    basedir = args.basedir # 存储目录
+    expname = args.expname # 项目名称
+    os.makedirs(os.path.join(basedir,expname),exist_ok=True) # 创建存储文件夹
+    f = os.path.join(basedir,expname,'args.txt') # 打开参数文件args.txt
+    with open(f,'w') as file:
+        for arg in sorted(vars(args)):
+            attr = getattr(args,arg)
+            file.write('{} = {}\n'.format(arg,attr)) # 将参数信息写入参数文件args.txt
+    if args.config is not None:
+        f = os.path.join(basedir,expname,'config.txt') # 打开配置文件config.txt
+        with open(f,'w') as file:
+            file.write(open(args.config,'r').read()) # 将配置信息写入配置文件config.txt
+    print('>>>第二步,训练模型')
+    render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer = create_nerf(args) # 创建NeRF模型
+    print('>>>第三步,体积渲染')
+    print('>>>第四步,误差传播')
     print('~~~模型训练函数结束~~~')
 # 主函数
 if __name__=='__main__':

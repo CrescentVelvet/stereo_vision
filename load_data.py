@@ -47,7 +47,7 @@ def load_blender_data(basedir,half_res=False,testskip=1):
             fname = os.path.join(basedir,frame['file_path'] + '.png')
             imgs.append(imageio.imread(fname))
             poses.append(numpy.array(frame['transform_matrix']))
-        imgs = (numpy.array(imgs) / 255.).astype(numpy.float32) # keep all 4 channels (RGBA)
+        imgs = (numpy.array(imgs) / 255.0).astype(numpy.float32) # keep all 4 channels (RGBA)
         poses = numpy.array(poses).astype(numpy.float32)
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
@@ -57,7 +57,7 @@ def load_blender_data(basedir,half_res=False,testskip=1):
     poses = numpy.concatenate(all_poses,0)    
     H,W = imgs[0].shape[:2]
     camera_angle_x = float(meta['camera_angle_x'])
-    focal = .5 * W / numpy.tan(.5 * camera_angle_x)    
+    focal = 0.5 * W / numpy.tan(0.5 * camera_angle_x)    
     render_poses = torch.stack([pose_spherical(angle,-30.0,4.0) for angle in numpy.linspace(-180,180,40+1)[:-1]],0)
     if half_res:
         H = H//2
@@ -68,7 +68,7 @@ def load_blender_data(basedir,half_res=False,testskip=1):
             imgs_half_res[i] = cv2.resize(img,(W,H),interpolation=cv2.INTER_AREA)
         imgs = imgs_half_res        
     return imgs,poses,render_poses,[H,W,focal],i_split
-def load_LINEMOD_data(basedir,half_res=False,testskip=1):
+def load_linemod_data(basedir,half_res=False,testskip=1):
     splits = ['train','val','test']
     metas = {}
     for s in splits:
@@ -91,7 +91,7 @@ def load_LINEMOD_data(basedir,half_res=False,testskip=1):
                 print(f"{idx_test}th test frame: {fname}")
             imgs.append(imageio.imread(fname))
             poses.append(numpy.array(frame['transform_matrix']))
-        imgs = (numpy.array(imgs) / 255.).astype(numpy.float32) # keep all 4 channels (RGBA)
+        imgs = (numpy.array(imgs) / 255.0).astype(numpy.float32) # keep all 4 channels (RGBA)
         poses = numpy.array(poses).astype(numpy.float32)
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
