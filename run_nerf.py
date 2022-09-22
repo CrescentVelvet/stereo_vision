@@ -1,6 +1,7 @@
 # NeRF神经辐射场
 import os
 import torch
+import torch.nn as nn
 import numpy as np
 import configargparse
 import load_data
@@ -60,6 +61,181 @@ def config_parser():
     parser.add_argument('--i_testset',type=int,default=50000,help='frequency of testset saving') # 测试数据集保存频率
     parser.add_argument('--i_video',type=int,default=50000,help='frequency of render_poses video saving') # 渲染视频保存频率
     return parser
+# 嵌入模型类
+class Embedder:
+    def __init__(self,**kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()        
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']
+        out_dim = 0
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x : x)
+            out_dim += d            
+        max_freq = self.kwargs['max_freq_log2']
+        N_freqs = self.kwargs['num_freqs']        
+        if self.kwargs['log_sampling']:
+            freq_bands = 2.**torch.linspace(0.,max_freq,steps=N_freqs)
+        else:
+            freq_bands = torch.linspace(2.**0.,2.**max_freq,steps=N_freqs)            
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x,p_fn=p_fn,freq=freq : p_fn(x * freq))
+                out_dim += d                    
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim        
+    def embed(self,inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns],-1)
+# NeRF模型类
+class NeRF(nn.Module):
+    def __init__(self,
+                 D=8,
+                 W=256,
+                 input_ch=3,
+                 input_ch_views=3,
+                 output_ch=4,
+                 skips=[4],
+                 use_viewdirs=False): # 是否输入射线方向
+        super(NeRF,self).__init__()
+        self.D = D
+        self.W = W
+        self.input_ch = input_ch
+        self.input_ch_views = input_ch_views
+        self.skips = skips
+        self.use_viewdirs = use_viewdirs # 是否输入射线方向
+        self.pts_linears = nn.ModuleList([nn.Linear(input_ch,W)] + [nn.Linear(W,W) if i not in self.skips else nn.Linear(W + input_ch,W) for i in range(D-1)])
+        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W,W//2)]) # 根据官方代码(https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        # self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W,W//2)] + [nn.Linear(W//2,W//2) for i in range(D//2)]) # 根据论文代码
+        if use_viewdirs: # 如果输入射线方向
+            self.feature_linear = nn.Linear(W,W)
+            self.alpha_linear = nn.Linear(W,1)
+            self.rgb_linear = nn.Linear(W//2,3)
+        else:
+            self.output_linear = nn.Linear(W,output_ch)
+    def forward(self,x):
+        input_pts,input_views = torch.split(x,[self.input_ch,self.input_ch_views],dim=-1)
+        h = input_pts
+        for i,l in enumerate(self.pts_linears):
+            h = self.pts_linears[i](h)
+            h = F.relu(h)
+            if i in self.skips:
+                h = torch.cat([input_pts,h],-1)
+        if self.use_viewdirs: # 如果输入射线方向
+            alpha = self.alpha_linear(h)
+            feature = self.feature_linear(h)
+            h = torch.cat([feature,input_views],-1)        
+            for i,l in enumerate(self.views_linears):
+                h = self.views_linears[i](h)
+                h = F.relu(h)
+            rgb = self.rgb_linear(h)
+            outputs = torch.cat([rgb,alpha],-1)
+        else:
+            outputs = self.output_linear(h)
+        return outputs
+    def load_weights_from_keras(self,weights):
+        assert self.use_viewdirs,"Not implemented if use_viewdirs=False"
+        for i in range(self.D): # 加载pts_linears
+            idx_pts_linears = 2 * i
+            self.pts_linears[i].weight.data = torch.from_numpy(np.transpose(weights[idx_pts_linears]))
+            self.pts_linears[i].bias.data = torch.from_numpy(np.transpose(weights[idx_pts_linears+1]))
+        idx_feature_linear = 2 * self.D # 加载feature_linear
+        self.feature_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_feature_linear]))
+        self.feature_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_feature_linear+1]))
+        idx_views_linears = 2 * self.D + 2 # 加载views_linears
+        self.views_linears[0].weight.data = torch.from_numpy(np.transpose(weights[idx_views_linears]))
+        self.views_linears[0].bias.data = torch.from_numpy(np.transpose(weights[idx_views_linears+1]))
+        idx_rbg_linear = 2 * self.D + 4 # 加载rgb_linear
+        self.rgb_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_rbg_linear]))
+        self.rgb_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_rbg_linear+1]))
+        idx_alpha_linear = 2 * self.D + 6 # 加载alpha_linear
+        self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
+        self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
+# 嵌入函数
+def get_embedder(multires,i=0):
+    if i == -1:
+        return nn.Identity(),3    
+    embed_kwargs = {
+                'include_input' : True,
+                'input_dims' : 3,
+                'max_freq_log2' : multires-1,
+                'num_freqs' : multires,
+                'log_sampling' : True,
+                'periodic_fns' : [torch.sin,torch.cos],
+    }    
+    embedder_obj = Embedder(**embed_kwargs)
+    embed = lambda x,eo=embedder_obj : eo.embed(x)
+    return embed,embedder_obj.out_dim
+# 模型建立函数
+def create_nerf(args):
+    embed_fn,input_ch = get_embedder(args.multires,args.i_embed) # 调用get_embedder获得一个对应的embedding嵌入函数
+    input_ch_views = 0
+    embeddirs_fn = None
+    if args.use_viewdirs: # 如果使用5D坐标取代3D坐标
+        embeddirs_fn,input_ch_views = get_embedder(args.multires_views,args.i_embed)
+    output_ch = 5 if args.N_importance > 0 else 4 # 如果每条射线附加的细采样点数大于0则输出5,否则输出4
+    skips = [4]
+    model = NeRF(D=args.netdepth,# 建立粗网络模型
+                 W=args.netwidth,
+                 input_ch=input_ch,
+                 output_ch=output_ch,
+                 skips=skips,
+                 input_ch_views=input_ch_views,
+                 use_viewdirs=args.use_viewdirs).to(device) # 是否使用5D坐标取代3D坐标
+    grad_vars = list(model.parameters()) # 提取粗网络模型梯度
+    model_fine = None
+    if args.N_importance > 0: # 如果每条射线附加的细采样点数大于0
+        model_fine = NeRF(D=args.netdepth_fine,# 建立细网络模型
+                          W=args.netwidth_fine,
+                          input_ch=input_ch,
+                          output_ch=output_ch,
+                          skips=skips,
+                          input_ch_views=input_ch_views,
+                          use_viewdirs=args.use_viewdirs).to(device) # 是否使用5D坐标取代3D坐标
+        grad_vars += list(model_fine.parameters()) # 累加细网络模型梯度
+    network_query_fn = lambda inputs,viewdirs,network_fn : run_network(inputs,
+                                                                       viewdirs,
+                                                                       network_fn,
+                                                                       embed_fn=embed_fn,
+                                                                       embeddirs_fn=embeddirs_fn,
+                                                                       netchunk=args.netchunk)
+    optimizer = torch.optim.Adam(params=grad_vars,lr=args.lrate,betas=(0.9,0.999)) # 创建Adam优化器
+    start = 0
+    basedir = args.basedir # 存储目录
+    expname = args.expname # 项目名称
+    if args.ft_path is not None and args.ft_path!='None': # 为粗网络加载权重checkpoints
+        ckpts = [args.ft_path]
+    else: # 读取已保存权重checkpoints
+        ckpts = [os.path.join(basedir,expname,f) for f in sorted(os.listdir(os.path.join(basedir,expname))) if 'tar' in f]
+    print('Found ckpts',ckpts)
+    if len(ckpts) > 0 and not args.no_reload: # 如果要从保存的模型中加载权重
+        ckpt_path = ckpts[-1] # 把checkpoints数组[-1]作为路径
+        print('Reloading from',ckpt_path)
+        ckpt = torch.load(ckpt_path) # 读取checkpoints权重
+        start = ckpt['global_step']
+        optimizer.load_state_dict(ckpt['optimizer_state_dict']) # 优化器载入权重
+        model.load_state_dict(ckpt['network_fn_state_dict']) # 粗网络模型载入权重
+        if model_fine is not None:
+            model_fine.load_state_dict(ckpt['network_fine_state_dict']) # 细网络模型载入权重
+    render_kwargs_train = { # 加载模型
+        'network_query_fn' : network_query_fn,
+        'perturb' : args.perturb,# 是否抖动
+        'N_importance' : args.N_importance,# 每条射线附加的细采样点数
+        'network_fine' : model_fine,# 细网络模型
+        'N_samples' : args.N_samples,# 每条射线的粗采样点数
+        'network_fn' : model,# 粗网络模型
+        'use_viewdirs' : args.use_viewdirs,# 是否使用5D坐标取代3D坐标
+        'white_bkgd' : args.white_bkgd,# 数据集blender选项,是否在白色bkgd上渲染
+        'raw_noise_std' : args.raw_noise_std,# 是否加入噪音方差
+    }
+    if args.dataset_type != 'llff' or args.no_ndc: # ndc仅适用于llff类型的前向数据
+        print('Not ndc!')
+        render_kwargs_train['ndc'] = False # 不使用ndc
+        render_kwargs_train['lindisp'] = args.lindisp
+    render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
+    render_kwargs_test['perturb'] = False
+    render_kwargs_test['raw_noise_std'] = 0.0
+    return render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer
 # 模型训练函数
 def train():
     print('~~~模型训练函数开始~~~')
@@ -101,6 +277,7 @@ def train():
             file.write(open(args.config,'r').read()) # 将配置信息写入配置文件config.txt
     print('>>>第二步,训练模型')
     render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer = create_nerf(args) # 创建NeRF模型
+    global_step = start # 开始步骤
     print('>>>第三步,体积渲染')
     print('>>>第四步,误差传播')
     print('~~~模型训练函数结束~~~')
