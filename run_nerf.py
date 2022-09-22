@@ -2,6 +2,7 @@
 import torch
 import numpy as np
 import configargparse
+import load_data
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # 设备使用GPU或CPU
 np.random.seed(0) # 生成随机数种子
 DEBUG = False # 调试符号
@@ -64,7 +65,21 @@ def train():
     parser = config_parser() # 设置参数
     args = parser.parse_args() # 读取参数
     K = None
-    print('>>>第一步,加载数据集')
+    print('>>>第一步,加载数据集',args.dataset_type)
+    if args.dataset_type == 'blender': # 加载数据集blender
+        images,poses,render_poses,hwf,i_split = load_data.load_blender_data(args.datadir,args.half_res,args.testskip)
+        print('加载数据集 blender',images.shape,render_poses.shape,hwf,args.datadir)
+        i_train,i_val,i_test = i_split
+        near = 2.0
+        far = 6.0
+        if args.white_bkgd: # 数据集blender选项,是否在白色bkgd上渲染
+            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
+        else:
+            images = images[...,:3]
+    else: # 数据集类型未知
+        print('数据集类型未知',args.dataset_type)
+        return
+
     print('>>>第二步,加载数据集')
     print('>>>第三步,加载数据集')
     print('>>>第四步,加载数据集')
@@ -72,6 +87,6 @@ def train():
 # 主函数
 if __name__=='__main__':
     print('~~~主函数开始~~~')
-    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
     train()
     print('~~~主函数结束~~~')
