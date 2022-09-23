@@ -245,7 +245,9 @@ def train():
     print('>>>第一步,加载数据集',args.dataset_type)
     if args.dataset_type == 'blender': # 加载数据集blender
         images,poses,render_poses,hwf,i_split = load_data.load_blender_data(args.datadir,args.half_res,args.testskip)
-        print('*数据集 blender 图像尺寸',images.shape,'渲染尺寸',render_poses.shape,'高宽中心',hwf,'目录',args.datadir)
+        print('*数据集',args.dataset_type)
+        print('*图像尺寸',images.shape,'渲染尺寸',render_poses.shape,'高宽中心',hwf)
+        print('*目录',args.datadir)
         i_train,i_val,i_test = i_split
         near = 2.0
         far = 6.0
@@ -269,7 +271,7 @@ def train():
     f = os.path.join(basedir,expname,'args.txt') # 打开参数文件args.txt
     with open(f,'w') as file:
         for arg in sorted(vars(args)):
-            attr = getattr(args,arg)
+            attr = getattr(args,arg) # 读取参数信息
             file.write('{} = {}\n'.format(arg,attr)) # 将参数信息写入参数文件args.txt
     if args.config is not None:
         f = os.path.join(basedir,expname,'config.txt') # 打开配置文件config.txt
@@ -278,6 +280,50 @@ def train():
     print('>>>第二步,训练模型')
     render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer = create_nerf(args) # 创建NeRF模型
     global_step = start # 开始步骤
+    bds_dict = {'near':near,'far':far,} # 两个元素
+    render_kwargs_train.update(bds_dict) # 训练集九个元素增加两个元素
+    render_kwargs_test.update(bds_dict) # 测试集九个元素增加两个元素
+    render_poses = torch.Tensor(render_poses).to(device) # 测试数据render_poses加载到设备中
+    if args.render_only: # 如果仅渲染并生成视频,使用预渲染模型
+        print('*仅渲染模式') # 打印仅渲染模式
+        with torch.no_grad(): # 关闭反向传播,禁用梯度计算
+            if args.render_test: # 使用测试数据集进行渲染
+                images = images[i_test]
+            else: # 默认情况渲染更平滑
+                images = None
+            testsavedir = os.path.join(basedir,expname,'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path',start))
+            os.makedirs(testsavedir,exist_ok=True)
+            print('*测试数据集渲染尺寸',render_poses.shape)
+            rgbs,_ = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test,gt_imgs=images,savedir=testsavedir,render_factor=args.render_factor)
+            print('*渲染视频保存地址',testsavedir)
+            imageio.mimwrite(os.path.join(testsavedir,'video.mp4'),to8b(rgbs),fps=30,quality=8)
+            return
+    N_rand = args.N_rand # 梯度步长batch size
+    use_batching = not args.no_batching # 是否使用批处理
+    if use_batching: # 如果使用批处理,一次读取一批图像
+        print('*批处理模式')
+        rays = np.stack([get_rays_np(H,W,K,p) for p in poses[:,:3,:4]],0) # 获取相机射线rays[N,ro+rd,H,W,3]
+        print('*获取相机射线进行合并')
+        rays_rgb = np.concatenate([rays,images[:,None]],1) # 沿axis=1拼接,格式=[N,ro+rd+rgb,H,W,3]
+        rays_rgb = np.transpose(rays_rgb,[0,2,3,1,4]) # 改变shape,格式=[N,H,W,ro+rd+rgb,3]
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train],0) # 只使用训练数据集
+        rays_rgb = np.reshape(rays_rgb,[-1,3,3]) # 得到(N-测试样本数目)*H*W个相机射线,格式=[(N-1)*H*W,ro+rd+rgb,3]
+        rays_rgb = rays_rgb.astype(np.float32) # 改变相机射线格式
+        print('*打乱相机射线顺序')
+        np.random.shuffle(rays_rgb) # 打乱相机射线顺序
+        print('done')
+        i_batch = 0
+    if use_batching: # 如果使用批处理,一次读取一批图像
+        images = torch.Tensor(images).to(device) # 图像训练数据加载到设备中
+    poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
+    if use_batching: # 如果使用批处理,一次读取一批图像
+        rays_rgb = torch.Tensor(rays_rgb).to(device) # 射线训练数据加载到设备中
+    N_iters = 200000 + 1 # 默认训练200000次(建议修改,加快测试速度)
+    print('Begin')
+    print('TRAIN views are',i_train)
+    print('TEST views are',i_test)
+    print('VAL views are',i_val)
+    start = start + 1 # 记录训练次数
     print('>>>第三步,体积渲染')
     print('>>>第四步,误差传播')
     print('~~~模型训练函数结束~~~')
