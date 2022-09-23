@@ -1,5 +1,7 @@
 # NeRF神经辐射场
 import os
+import time
+import tqdm
 import torch
 import torch.nn as nn
 import numpy as np
@@ -151,6 +153,17 @@ class NeRF(nn.Module):
         idx_alpha_linear = 2 * self.D + 6 # 加载alpha_linear
         self.alpha_linear.weight.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear]))
         self.alpha_linear.bias.data = torch.from_numpy(np.transpose(weights[idx_alpha_linear+1]))
+# 获取射线函数
+def get_rays(H,W,K,c2w):
+    i,j = torch.meshgrid(torch.linspace(0,W-1,W),torch.linspace(0,H-1,H)) # pytorch's meshgrid has indexing='ij'
+    i = i.t()
+    j = j.t()
+    dirs = torch.stack([(i-K[0][2])/K[0][0],-(j-K[1][2])/K[1][1],-torch.ones_like(i)],-1)
+    # Rotate ray directions from camera frame to the world frame
+    rays_d = torch.sum(dirs[...,np.newaxis,:] * c2w[:3,:3],-1)  # dot product,equals to: [c2w.dot(dir) for dir in dirs]
+    # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    rays_o = c2w[:3,-1].expand(rays_d.shape)
+    return rays_o,rays_d
 # 嵌入函数
 def get_embedder(multires,i=0):
     if i == -1:
@@ -168,6 +181,7 @@ def get_embedder(multires,i=0):
     return embed,embedder_obj.out_dim
 # 模型建立函数
 def create_nerf(args):
+    print('-开始建立模型')
     embed_fn,input_ch = get_embedder(args.multires,args.i_embed) # 调用get_embedder获得一个对应的embedding嵌入函数
     input_ch_views = 0
     embeddirs_fn = None
@@ -207,10 +221,10 @@ def create_nerf(args):
         ckpts = [args.ft_path]
     else: # 读取已保存权重checkpoints
         ckpts = [os.path.join(basedir,expname,f) for f in sorted(os.listdir(os.path.join(basedir,expname))) if 'tar' in f]
-    print('Found ckpts',ckpts)
+        print('-读取已保存权重',ckpts)
     if len(ckpts) > 0 and not args.no_reload: # 如果要从保存的模型中加载权重
         ckpt_path = ckpts[-1] # 把checkpoints数组[-1]作为路径
-        print('Reloading from',ckpt_path)
+        print('-从保存的模型中加载权重',ckpt_path)
         ckpt = torch.load(ckpt_path) # 读取checkpoints权重
         start = ckpt['global_step']
         optimizer.load_state_dict(ckpt['optimizer_state_dict']) # 优化器载入权重
@@ -229,12 +243,12 @@ def create_nerf(args):
         'raw_noise_std' : args.raw_noise_std,# 是否加入噪音方差
     }
     if args.dataset_type != 'llff' or args.no_ndc: # ndc仅适用于llff类型的前向数据
-        print('Not ndc!')
         render_kwargs_train['ndc'] = False # 不使用ndc
         render_kwargs_train['lindisp'] = args.lindisp
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.0
+    print('-完成建立模型')
     return render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer
 # 模型训练函数
 def train():
@@ -293,7 +307,7 @@ def train():
                 images = None
             testsavedir = os.path.join(basedir,expname,'renderonly_{}_{:06d}'.format('test' if args.render_test else 'path',start))
             os.makedirs(testsavedir,exist_ok=True)
-            print('*测试数据集渲染尺寸',render_poses.shape)
+            print('*测试数据render_poses渲染尺寸',render_poses.shape)
             rgbs,_ = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test,gt_imgs=images,savedir=testsavedir,render_factor=args.render_factor)
             print('*渲染视频保存地址',testsavedir)
             imageio.mimwrite(os.path.join(testsavedir,'video.mp4'),to8b(rgbs),fps=30,quality=8)
@@ -309,21 +323,56 @@ def train():
         rays_rgb = np.stack([rays_rgb[i] for i in i_train],0) # 只使用训练数据集
         rays_rgb = np.reshape(rays_rgb,[-1,3,3]) # 得到(N-测试样本数目)*H*W个相机射线,格式=[(N-1)*H*W,ro+rd+rgb,3]
         rays_rgb = rays_rgb.astype(np.float32) # 改变相机射线格式
-        print('*打乱相机射线顺序')
         np.random.shuffle(rays_rgb) # 打乱相机射线顺序
-        print('done')
+        print('*打乱相机射线顺序')
         i_batch = 0
-    if use_batching: # 如果使用批处理,一次读取一批图像
         images = torch.Tensor(images).to(device) # 图像训练数据加载到设备中
-    poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
-    if use_batching: # 如果使用批处理,一次读取一批图像
         rays_rgb = torch.Tensor(rays_rgb).to(device) # 射线训练数据加载到设备中
-    N_iters = 200000 + 1 # 默认训练200000次(建议修改,加快测试速度)
-    print('Begin')
-    print('TRAIN views are',i_train)
-    print('TEST views are',i_test)
-    print('VAL views are',i_val)
+    poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
+    N_iters = 2048 + 1 # 默认训练200000次(建议修改,加快测试速度)
+    print('*训练集',i_train)
+    print('*测试集',i_test)
+    print('*验证集',i_val)
     start = start + 1 # 记录训练次数
+    print('开始第',start,'次训练')
+    for i in tqdm.trange(start,N_iters): # 循环训练N_iters次
+        time0 = time.time() # 每次训练开始时间
+        if use_batching: # 如果使用批处理,一次读取一批图像
+            batch = rays_rgb[i_batch:i_batch+N_rand] # 从相机射线中取一个batch,格式=[B,2+1,3*?]
+            batch = torch.transpose(batch,0,1) # 转换0维和1维数据
+            batch_rays,target_s = batch[:2],batch[2] # batch_rays格式=[ro+rd,4096,3],target_s格式=[4096,3]对应的是rgb
+            i_batch += N_rand # 一次增加一个梯度步长batch size
+            if i_batch >= rays_rgb.shape[0]: # 如果所有样本都遍历过了则打乱数据顺序
+                print("*经过一个epoch后打乱数据顺序")
+                rand_idx = torch.randperm(rays_rgb.shape[0])
+                rays_rgb = rays_rgb[rand_idx]
+                i_batch = 0
+        else: # 如果不使用批处理,一次仅读取一张图像
+            img_i = np.random.choice(i_train)
+            target = images[img_i]
+            target = torch.Tensor(target).to(device)
+            pose = poses[img_i,:3,:4]
+            if N_rand is not None: # 如果梯度步长batch size存在
+                rays_o,rays_d = get_rays(H,W,K,torch.Tensor(pose)) # 获取相机射线(H,W,3),(H,W,3)
+                if i < args.precrop_iters: # 当i小于中心crop的训练步数时
+                    dH = int(H//2*args.precrop_frac)
+                    dW = int(W//2*args.precrop_frac)
+                    coords = torch.stack(
+                        torch.meshgrid(
+                            torch.linspace(H//2-dH,H//2+dH-1,2*dH),
+                            torch.linspace(W//2-dW,W//2+dW-1,2*dW)
+                        ),-1)
+                    if i == start:
+                        print(f'*在训练{args.precrop_iters}次之前进行大小为{2*dH}x{2*dW}的中心裁剪')                
+                else:
+                    coords = torch.stack(torch.meshgrid(torch.linspace(0,H-1,H),torch.linspace(0,W-1,W)),-1)  # (H,W,2)
+                coords = torch.reshape(coords,[-1,2])  # (H * W,2)
+                select_inds = np.random.choice(coords.shape[0],size=[N_rand],replace=False)  # (N_rand,)
+                select_coords = coords[select_inds].long()  # (N_rand,2)
+                rays_o = rays_o[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
+                rays_d = rays_d[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
+                batch_rays = torch.stack([rays_o,rays_d],0)
+                target_s = target[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
     print('>>>第三步,体积渲染')
     print('>>>第四步,误差传播')
     print('~~~模型训练函数结束~~~')
