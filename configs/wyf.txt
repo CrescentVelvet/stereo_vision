@@ -12,3 +12,5 @@ N_rand = 1024
 precrop_iters = 500
 precrop_frac = 0.5
 half_res = True
+i_video = 500
+i_train_iters = 1000

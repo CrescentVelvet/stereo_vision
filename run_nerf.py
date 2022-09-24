@@ -63,7 +63,8 @@ def config_parser():
     parser.add_argument('--i_img',type=int,default=500,help='frequency of tensorboard image logging') # 可视化tensorboard绘制图像频率
     parser.add_argument('--i_weights',type=int,default=10000,help='frequency of weight ckpt saving') # 权重ckpt=checkpoint保存频率
     parser.add_argument('--i_testset',type=int,default=50000,help='frequency of testset saving') # 测试数据集保存频率
-    parser.add_argument('--i_video',type=int,default=500,help='frequency of render_poses video saving') # 渲染视频保存频率
+    parser.add_argument('--i_video',type=int,default=50000,help='frequency of render_poses video saving') # 渲染视频保存频率
+    parser.add_argument('--i_train_iters',type=int,default=200000,help='total cycle training times') # 我自行添加的总循环训练次数
     return parser
 # 嵌入模型类
 class Embedder:
@@ -572,7 +573,7 @@ def train():
         images = torch.Tensor(images).to(device) # 图像训练数据加载到设备中
         rays_rgb = torch.Tensor(rays_rgb).to(device) # 射线训练数据加载到设备中
     poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
-    N_iters = 1000 + 1 # 默认训练200000次(建议修改,加快测试速度)
+    N_iters = args.i_train_iters + 1 # 默认训练200000次,测试时修改以加快速度
     print('*训练集',i_train)
     print('*测试集',i_test)
     print('*验证集',i_val)

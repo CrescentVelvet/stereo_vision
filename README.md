@@ -38,4 +38,6 @@ conda install -c conda-forge opencv
 wget http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/nerf_example_data.zip
 activate torch
 python run_nerf.py --config configs/wyf.txt
+python run_nerf.py --config configs/lego.txt
+python run_nerf.py --config configs/fern.txt
 ```
