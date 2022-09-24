@@ -495,7 +495,7 @@ def create_nerf(args):
     return render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer
 # 模型训练函数
 def train():
-    print('~~~模型训练函数开始~~~')
+    print('~~~训练函数开始~~~')
     parser = config_parser() # 设置参数
     args = parser.parse_args() # 读取参数
     K = None
@@ -651,14 +651,14 @@ def train():
                 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             },path)
-            print(f'*每{args.i_weights}次循环保存断点{path}') # 打印保存checkpoint
+            print(f'*每{args.i_weights}次循环保存断点到{path}中') # 打印保存checkpoint
         if i % args.i_testset == 0 and i > 0: # 按频率保存测试数据集
             testsavedir = os.path.join(basedir,expname,'testset_{:06d}'.format(i))
             os.makedirs(testsavedir,exist_ok=True)
             print('test poses shape',poses[i_test].shape)
             with torch.no_grad(): # 关闭反向传播,禁用梯度计算
                 render_path(torch.Tensor(poses[i_test]).to(device),hwf,K,args.chunk,render_kwargs_test,gt_imgs=images[i_test],savedir=testsavedir)
-            print(f'*每{args.i_testset}次循环保存测试数据集{testsavedir}') # 打印保存测试数据集
+            print(f'*每{args.i_testset}次循环保存测试数据集到{testsavedir}中') # 打印保存测试数据集
         if i % args.i_video == 0 and i > 0: # 按频率保存mp4渲染视频
             with torch.no_grad(): # 关闭反向传播,禁用梯度计算
                 rgbs,disps = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test) # 渲染一批射线的颜色和视差
@@ -666,9 +666,9 @@ def train():
             moviebase = os.path.join(basedir,expname,'{}_spiral_{:06d}_'.format(expname,i))
             imageio.mimwrite(moviebase + 'rgb.mp4',to8b(rgbs),fps=30,quality=8) # 保存颜色视频
             # imageio.mimwrite(moviebase + 'disp.mp4',to8b(disps / np.max(disps)),fps=30,quality=8) # 保存视差视频
-            print(f'*每{args.i_video}次循环保存颜色视频{moviebase}rgb.mp4') # 打印保存颜色视频
+            print(f'*每{args.i_video}次循环保存颜色视频到{moviebase}rgb.mp4中') # 打印保存颜色视频
         if i % args.i_print==0 and i > 0: # 按频率打印输出和日志
-            tqdm.tqdm.write(f"*第{i}次循环 损失:{loss.item()} 信噪比:{psnr.item()}") # 回头打印循环信息
+            tqdm.tqdm.write(f"*第{i}次循环 损失:{loss.item():.4f} 信噪比:{psnr.item():.4f}") # 回头打印循环信息
         """
             print(expname,i,psnr.numpy(),loss.numpy(),global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -698,7 +698,7 @@ def train():
                         tf.contrib.summary.image('z_std',extras['z_std'][tf.newaxis,...,tf.newaxis])
         """
         global_step += 1 # 当前步骤加一
-    print('~~~模型训练函数结束~~~')
+    print('~~~训练函数结束~~~')
 # 主函数
 if __name__=='__main__':
     print('~~~主函数开始~~~')
