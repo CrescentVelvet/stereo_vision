@@ -454,8 +454,8 @@ def render(H, # 图像高度,单位是像素,int类型
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k],k_sh)
     k_extract = ['rgb_map', # 射线的预测颜色,[batch_size,3]类型
-                'disp_map', # 射线的视差图像,深度的倒数,[batch_size]类型
-                'acc_map'] # 射线的累积不透明度,密累加度,[batch_size]类型
+                 'disp_map', # 射线的视差图像,深度的倒数,[batch_size]类型
+                 'acc_map'] # 射线的累积不透明度,密累加度,[batch_size]类型
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -538,12 +538,12 @@ def train():
         images = torch.Tensor(images).to(device) # 图像训练数据加载到设备中
         rays_rgb = torch.Tensor(rays_rgb).to(device) # 射线训练数据加载到设备中
     poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
-    N_iters = 2048 + 1 # 默认训练200000次(建议修改,加快测试速度)
+    N_iters = 512 + 1 # 默认训练200000次(建议修改,加快测试速度)
     print('*训练集',i_train)
     print('*测试集',i_test)
     print('*验证集',i_val)
     start = start + 1 # 记录训练次数
-    print('开始第',start,'次训练')
+    print('*开始第',start,'次训练')
     for i in tqdm.trange(start,N_iters): # 循环训练N_iters次
         time0 = time.time() # 每次训练开始时间
         if use_batching: # 如果使用批处理,一次读取一批图像
@@ -574,23 +574,96 @@ def train():
                     if i == start:
                         print(f'*在训练{args.precrop_iters}次之前进行大小为{2*dH}x{2*dW}的中心裁剪')                
                 else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0,H-1,H),torch.linspace(0,W-1,W)),-1)  # (H,W,2)
-                coords = torch.reshape(coords,[-1,2])  # (H * W,2)
-                select_inds = np.random.choice(coords.shape[0],size=[N_rand],replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand,2)
-                rays_o = rays_o[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
-                rays_d = rays_d[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
+                    coords = torch.stack(torch.meshgrid(torch.linspace(0,H-1,H),torch.linspace(0,W-1,W)),-1) # (H,W,2)
+                coords = torch.reshape(coords,[-1,2]) # (H * W,2)
+                select_inds = np.random.choice(coords.shape[0],size=[N_rand],replace=False) # (N_rand,)
+                select_coords = coords[select_inds].long() # (N_rand,2)
+                rays_o = rays_o[select_coords[:,0],select_coords[:,1]] # (N_rand,3)
+                rays_d = rays_d[select_coords[:,0],select_coords[:,1]] # (N_rand,3)
                 batch_rays = torch.stack([rays_o,rays_d],0)
-                target_s = target[select_coords[:,0],select_coords[:,1]]  # (N_rand,3)
-    print('>>>第三步,体积渲染')
-    rgb,disp,acc,extras = render(H,W,K, # 返回渲染一批的颜色,视差图,不透明度,其他信息
-                                 chunk=args.chunk, # 同时处理的最大射线数,用于防止内存溢出,int类型
-                                 rays=batch_rays, # 一批相机射线
-                                 verbose=i < 10, # 是否打印更多调试信息
-                                 retraw=True,
-                                 **render_kwargs_train)
-        
-    print('>>>第四步,误差传播')
+                target_s = target[select_coords[:,0],select_coords[:,1]] # (N_rand,3)
+        # print('>>>第三步,体积渲染')
+        rgb,disp,acc,extras = render(H,W,K, # 返回渲染一批的颜色,视差图,不透明度,其他信息
+                                     chunk=args.chunk, # 同时处理的最大射线数,用于防止内存溢出,int类型
+                                     rays=batch_rays, # 一批相机射线
+                                     verbose=i < 10, # 是否打印更多调试信息
+                                     retraw=True,
+                                     **render_kwargs_train)
+        # print('>>>第四步,误差传播')
+        img2mse = lambda x,y : torch.mean((x-y)**2) # MSE均方误差损失函数
+        mse2psnr = lambda x : -10.0*torch.log(x)/torch.log(torch.Tensor([10.0])) # PSNR信噪比函数
+        to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
+        optimizer.zero_grad() # 清空优化器历史梯度
+        img_loss = img2mse(rgb,target_s) # 计算MSE均方误差损失
+        trans = extras['raw'][...,-1]
+        loss = img_loss # 损失记为MSE均方误差损失
+        psnr = mse2psnr(img_loss) # 计算PSNR信噪比
+        if 'rgb0' in extras:
+            img_loss0 = img2mse(extras['rgb0'],target_s)
+            loss = loss + img_loss0
+            psnr0 = mse2psnr(img_loss0)
+        loss.backward() # 误差反向传播
+        optimizer.step() # 更新优化器参数
+        decay_rate = 0.1 # 设置学习率0.1
+        decay_steps = args.lrate_decay * 1000 # 设置指数学习率衰减
+        new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps)) # 设置每次训练使用衰减学习率
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lrate # 修改优化器参数组中的学习率
+        dt = time.time()-time0 # 计算训练用时
+        if i % args.i_weights == 0: # 按频率保存checkpoint
+            path = os.path.join(basedir,expname,'{:06d}.tar'.format(i))
+            torch.save({
+                'global_step': global_step,
+                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            },path)
+            print('Saved checkpoints at',path) # 打印保存checkpoint
+        if i % args.i_video == 0 and i > 0: # 按频率保存mp4渲染视频
+            with torch.no_grad(): # 关闭反向传播,禁用梯度计算
+                rgbs,disps = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test)
+            print('Done,saving',rgbs.shape,disps.shape)
+            moviebase = os.path.join(basedir,expname,'{}_spiral_{:06d}_'.format(expname,i))
+            imageio.mimwrite(moviebase + 'rgb.mp4',to8b(rgbs),fps=30,quality=8) # 保存颜色视频
+            imageio.mimwrite(moviebase + 'disp.mp4',to8b(disps / np.max(disps)),fps=30,quality=8) # 保存深度视频
+        if i % args.i_testset == 0 and i > 0: # 按频率保存测试数据集
+            testsavedir = os.path.join(basedir,expname,'testset_{:06d}'.format(i))
+            os.makedirs(testsavedir,exist_ok=True)
+            print('test poses shape',poses[i_test].shape)
+            with torch.no_grad(): # 关闭反向传播,禁用梯度计算
+                render_path(torch.Tensor(poses[i_test]).to(device),hwf,K,args.chunk,render_kwargs_test,gt_imgs=images[i_test],savedir=testsavedir)
+            print('Saved test set')
+        if i % args.i_print==0: # 按频率打印输出和日志
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+        """
+            print(expname,i,psnr.numpy(),loss.numpy(),global_step.numpy())
+            print('iter time {:.05f}'.format(dt))
+            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
+                tf.contrib.summary.scalar('loss',loss)
+                tf.contrib.summary.scalar('psnr',psnr)
+                tf.contrib.summary.histogram('tran',trans)
+                if args.N_importance > 0:
+                    tf.contrib.summary.scalar('psnr0',psnr0)
+            if i % args.i_img == 0: # 按频率在tensorboard绘制图像
+                img_i = np.random.choice(i_val)
+                target = images[img_i]
+                pose = poses[img_i,:3,:4]
+                with torch.no_grad():
+                    rgb,disp,acc,extras = render(H,W,focal,chunk=args.chunk,c2w=pose,**render_kwargs_test)
+                psnr = mse2psnr(img2mse(rgb,target))
+                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                    tf.contrib.summary.image('rgb',to8b(rgb)[tf.newaxis])
+                    tf.contrib.summary.image('disp',disp[tf.newaxis,...,tf.newaxis])
+                    tf.contrib.summary.image('acc',acc[tf.newaxis,...,tf.newaxis])
+                    tf.contrib.summary.scalar('psnr_holdout',psnr)
+                    tf.contrib.summary.image('rgb_holdout',target[tf.newaxis])
+                if args.N_importance > 0:
+                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
+                        tf.contrib.summary.image('rgb0',to8b(extras['rgb0'])[tf.newaxis])
+                        tf.contrib.summary.image('disp0',extras['disp0'][tf.newaxis,...,tf.newaxis])
+                        tf.contrib.summary.image('z_std',extras['z_std'][tf.newaxis,...,tf.newaxis])
+        """
+        global_step += 1 # 当前步骤加一
     print('~~~模型训练函数结束~~~')
 # 主函数
 if __name__=='__main__':
