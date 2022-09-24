@@ -2,11 +2,12 @@
 import os
 import time
 import tqdm
+import imageio
+import configargparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import configargparse
 import load_data
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # 设备使用GPU或CPU
 np.random.seed(0) # 生成随机数种子
@@ -62,7 +63,7 @@ def config_parser():
     parser.add_argument('--i_img',type=int,default=500,help='frequency of tensorboard image logging') # 可视化tensorboard绘制图像频率
     parser.add_argument('--i_weights',type=int,default=10000,help='frequency of weight ckpt saving') # 权重ckpt=checkpoint保存频率
     parser.add_argument('--i_testset',type=int,default=50000,help='frequency of testset saving') # 测试数据集保存频率
-    parser.add_argument('--i_video',type=int,default=50000,help='frequency of render_poses video saving') # 渲染视频保存频率
+    parser.add_argument('--i_video',type=int,default=500,help='frequency of render_poses video saving') # 渲染视频保存频率
     return parser
 # 嵌入模型类
 class Embedder:
@@ -286,6 +287,81 @@ def render_rays(ray_batch, # 一批射线的原点方向数组,[batch_size,...]�
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
             print(f"! [Numerical Error] {k} contains nan or inf.")
     return ret # 返回封装的射线渲染结果
+# 图像渲染函数
+def render(H, # 图像高度,单位是像素,int类型
+           W, # 图像宽度,单位是像素,int类型
+           K, # 相机焦距,float类型
+           chunk=1024*32, # 同时处理的最大射线数,用于防止内存溢出,int类型
+           rays=None, # 相机射线数组,射线起点和方向一一对应,[2,batch_size,3]类型
+           c2w=None, # 相机世界转换矩阵,[3,4]类型
+           ndc=True, # 是否表示原始射线,即NDC坐标中的方向,bool类型
+           near=0.0, # 射线的最近距离,float或[batch_size]类型
+           far=1.0, # 射线的最远距离,float或[batch_size]类型
+           use_viewdirs=False, # 是否输入射线方向,bool类型
+           c2w_staticcam=None, # 相机世界转换矩阵,[3,4]类型
+           **kwargs): # 体积渲染函数返回射线对应的颜色,视差,不透明度
+    if c2w is not None: # 如果是渲染完整图像的特殊情况
+        rays_o,rays_d = get_rays(H,W,K,c2w) # 像素点坐标方向提取
+    else: # 否则使用提供的射线batch批处理
+        rays_o,rays_d = rays # 像素点坐标方向直接赋值
+    if use_viewdirs: # 如果输入射线方向
+        viewdirs = rays_d
+        if c2w_staticcam is not None: # 可视化viewdir效果的特例
+            rays_o,rays_d = get_rays(H,W,K,c2w_staticcam)
+        viewdirs = viewdirs / torch.norm(viewdirs,dim=-1,keepdim=True)
+        viewdirs = torch.reshape(viewdirs,[-1,3]).float()
+    sh = rays_d.shape # sh[4096,3]类型
+    if ndc: # 如果是前向场景
+        rays_o,rays_d = ndc_rays(H,W,K[0][0],1.0,rays_o,rays_d) # 像素点坐标方向使用ndc转换
+    rays_o = torch.reshape(rays_o,[-1,3]).float() # 创建射线batch批处理
+    rays_d = torch.reshape(rays_d,[-1,3]).float()
+    near,far = near * torch.ones_like(rays_d[...,:1]),far * torch.ones_like(rays_d[...,:1]) # near[4096,1]类型,far[4096,1]类型,全0或全1
+    rays = torch.cat([rays_o,rays_d,near,far],-1) # rays[4096,3+3+1+1=8]类型
+    if use_viewdirs: # 如果输入射线方向
+        rays = torch.cat([rays,viewdirs],-1)
+    all_ret = batchify_rays(rays,chunk,**kwargs) # 渲染一批射线,chunk默认值1024*32=32768
+    for k in all_ret:
+        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
+        all_ret[k] = torch.reshape(all_ret[k],k_sh)
+    k_extract = ['rgb_map', # 射线的预测颜色,[batch_size,3]类型
+                 'disp_map', # 射线的视差图像,深度的倒数,[batch_size]类型
+                 'acc_map'] # 射线的累积不透明度,密累加度,[batch_size]类型
+    ret_list = [all_ret[k] for k in k_extract]
+    ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
+    return ret_list + [ret_dict]
+# 颜色视差渲染函数
+def render_path(render_poses,
+                hwf, # 射线的高宽数据
+                K, # 相机焦距,float类型
+                chunk, # 同时处理的最大射线数,用于防止内存溢出,int类型
+                render_kwargs,
+                gt_imgs=None,
+                savedir=None, # 渲染图像保存路径
+                render_factor=0): # 下采样因子以提升渲染速度
+    H,W,focal = hwf # 提取高宽中心数据
+    if render_factor != 0: # 如果下采样因子不为0就对高宽中心数据进行下采样
+        H = H//render_factor # 高
+        W = W//render_factor # 宽
+        focal = focal/render_factor # 中心
+    rgbs = [] # 颜色
+    disps = [] # 视差
+    t = time.time() # 记录当前时间
+    print(f'-开始渲染{len(render_poses)}个视角的图像') # 打印渲染开始
+    for i,c2w in enumerate(tqdm.tqdm(render_poses)): # 遍历pose列表并绘制tqdm进度条,得到序号i和列表元素c2w
+        t = time.time()
+        rgb,disp,acc,_ = render(H,W,K,chunk=chunk,c2w=c2w[:3,:4],**render_kwargs) # 渲染射线得到颜色和视差
+        rgbs.append(rgb.cpu().numpy())
+        disps.append(disp.cpu().numpy())
+        if i == 0:
+            print(f'-颜色尺寸{rgb.shape},视差尺寸{disp.shape}')
+        if savedir is not None:
+            rgb8 = to8b(rgbs[-1])
+            filename = os.path.join(savedir,'{:03d}.png'.format(i))
+            imageio.imwrite(filename,rgb8) # 渲染结果保存为图像
+        tqdm.tqdm.write(f'-渲染第{i}个视角花费{time.time()-t:.4f}时间') # 回头打印渲染花费时间
+    rgbs = np.stack(rgbs,0) # 计算射线颜色
+    disps = np.stack(disps,0) # 计算射线视差
+    return rgbs,disps # 返回射线的颜色和视差
 # 嵌入函数
 def get_embedder(multires,i=0):
     if i == -1:
@@ -417,48 +493,6 @@ def create_nerf(args):
     render_kwargs_test['raw_noise_std'] = 0.0
     print('-完成建立模型')
     return render_kwargs_train,render_kwargs_test,start,grad_vars,optimizer
-# 渲染函数
-def render(H, # 图像高度,单位是像素,int类型
-           W, # 图像宽度,单位是像素,int类型
-           K, # 相机焦距,float类型
-           chunk=1024*32, # 同时处理的最大射线数,用于防止内存溢出,int类型
-           rays=None, # 相机射线数组,射线起点和方向一一对应,[2,batch_size,3]类型
-           c2w=None, # 相机世界转换矩阵,[3,4]类型
-           ndc=True, # 是否表示原始射线,即NDC坐标中的方向,bool类型
-           near=0.0, # 射线的最近距离,float或[batch_size]类型
-           far=1.0, # 射线的最远距离,float或[batch_size]类型
-           use_viewdirs=False, # 是否输入射线方向,bool类型
-           c2w_staticcam=None, # 相机世界转换矩阵,[3,4]类型
-           **kwargs): # 体积渲染函数返回射线对应的颜色,视差,不透明度
-    if c2w is not None: # 如果是渲染完整图像的特殊情况
-        rays_o,rays_d = get_rays(H,W,K,c2w) # 像素点坐标方向提取
-    else: # 否则使用提供的射线batch批处理
-        rays_o,rays_d = rays # 像素点坐标方向直接赋值
-    if use_viewdirs: # 如果输入射线方向
-        viewdirs = rays_d
-        if c2w_staticcam is not None: # 可视化viewdir效果的特例
-            rays_o,rays_d = get_rays(H,W,K,c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs,dim=-1,keepdim=True)
-        viewdirs = torch.reshape(viewdirs,[-1,3]).float()
-    sh = rays_d.shape # sh[4096,3]类型
-    if ndc: # 如果是前向场景
-        rays_o,rays_d = ndc_rays(H,W,K[0][0],1.0,rays_o,rays_d) # 像素点坐标方向使用ndc转换
-    rays_o = torch.reshape(rays_o,[-1,3]).float() # 创建射线batch批处理
-    rays_d = torch.reshape(rays_d,[-1,3]).float()
-    near,far = near * torch.ones_like(rays_d[...,:1]),far * torch.ones_like(rays_d[...,:1]) # near[4096,1]类型,far[4096,1]类型,全0或全1
-    rays = torch.cat([rays_o,rays_d,near,far],-1) # rays[4096,3+3+1+1=8]类型
-    if use_viewdirs: # 如果输入射线方向
-        rays = torch.cat([rays,viewdirs],-1)
-    all_ret = batchify_rays(rays,chunk,**kwargs) # 渲染一批射线,chunk默认值1024*32=32768
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k],k_sh)
-    k_extract = ['rgb_map', # 射线的预测颜色,[batch_size,3]类型
-                 'disp_map', # 射线的视差图像,深度的倒数,[batch_size]类型
-                 'acc_map'] # 射线的累积不透明度,密累加度,[batch_size]类型
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]
 # 模型训练函数
 def train():
     print('~~~模型训练函数开始~~~')
@@ -538,7 +572,7 @@ def train():
         images = torch.Tensor(images).to(device) # 图像训练数据加载到设备中
         rays_rgb = torch.Tensor(rays_rgb).to(device) # 射线训练数据加载到设备中
     poses = torch.Tensor(poses).to(device) # 位姿训练数据加载到设备中
-    N_iters = 512 + 1 # 默认训练200000次(建议修改,加快测试速度)
+    N_iters = 1000 + 1 # 默认训练200000次(建议修改,加快测试速度)
     print('*训练集',i_train)
     print('*测试集',i_test)
     print('*验证集',i_val)
@@ -595,13 +629,12 @@ def train():
         to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
         optimizer.zero_grad() # 清空优化器历史梯度
         img_loss = img2mse(rgb,target_s) # 计算MSE均方误差损失
-        trans = extras['raw'][...,-1]
-        loss = img_loss # 损失记为MSE均方误差损失
         psnr = mse2psnr(img_loss) # 计算PSNR信噪比
-        if 'rgb0' in extras:
+        loss = img_loss # 整体损失为MSE均方误差损失
+        if 'rgb0' in extras: # 单独求rgb0的损失并加到整体损失上
             img_loss0 = img2mse(extras['rgb0'],target_s)
-            loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
+            loss = loss + img_loss0
         loss.backward() # 误差反向传播
         optimizer.step() # 更新优化器参数
         decay_rate = 0.1 # 设置学习率0.1
@@ -610,7 +643,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate # 修改优化器参数组中的学习率
         dt = time.time()-time0 # 计算训练用时
-        if i % args.i_weights == 0: # 按频率保存checkpoint
+        if i % args.i_weights == 0 and i > 0: # 按频率保存checkpoint
             path = os.path.join(basedir,expname,'{:06d}.tar'.format(i))
             torch.save({
                 'global_step': global_step,
@@ -618,30 +651,31 @@ def train():
                 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             },path)
-            print('Saved checkpoints at',path) # 打印保存checkpoint
-        if i % args.i_video == 0 and i > 0: # 按频率保存mp4渲染视频
-            with torch.no_grad(): # 关闭反向传播,禁用梯度计算
-                rgbs,disps = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test)
-            print('Done,saving',rgbs.shape,disps.shape)
-            moviebase = os.path.join(basedir,expname,'{}_spiral_{:06d}_'.format(expname,i))
-            imageio.mimwrite(moviebase + 'rgb.mp4',to8b(rgbs),fps=30,quality=8) # 保存颜色视频
-            imageio.mimwrite(moviebase + 'disp.mp4',to8b(disps / np.max(disps)),fps=30,quality=8) # 保存深度视频
+            print(f'*每{args.i_weights}次循环保存断点{path}') # 打印保存checkpoint
         if i % args.i_testset == 0 and i > 0: # 按频率保存测试数据集
             testsavedir = os.path.join(basedir,expname,'testset_{:06d}'.format(i))
             os.makedirs(testsavedir,exist_ok=True)
             print('test poses shape',poses[i_test].shape)
             with torch.no_grad(): # 关闭反向传播,禁用梯度计算
                 render_path(torch.Tensor(poses[i_test]).to(device),hwf,K,args.chunk,render_kwargs_test,gt_imgs=images[i_test],savedir=testsavedir)
-            print('Saved test set')
-        if i % args.i_print==0: # 按频率打印输出和日志
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            print(f'*每{args.i_testset}次循环保存测试数据集{testsavedir}') # 打印保存测试数据集
+        if i % args.i_video == 0 and i > 0: # 按频率保存mp4渲染视频
+            with torch.no_grad(): # 关闭反向传播,禁用梯度计算
+                rgbs,disps = render_path(render_poses,hwf,K,args.chunk,render_kwargs_test) # 渲染一批射线的颜色和视差
+            # print('Done,saving',rgbs.shape,disps.shape)
+            moviebase = os.path.join(basedir,expname,'{}_spiral_{:06d}_'.format(expname,i))
+            imageio.mimwrite(moviebase + 'rgb.mp4',to8b(rgbs),fps=30,quality=8) # 保存颜色视频
+            # imageio.mimwrite(moviebase + 'disp.mp4',to8b(disps / np.max(disps)),fps=30,quality=8) # 保存视差视频
+            print(f'*每{args.i_video}次循环保存颜色视频{moviebase}rgb.mp4') # 打印保存颜色视频
+        if i % args.i_print==0 and i > 0: # 按频率打印输出和日志
+            tqdm.tqdm.write(f"*第{i}次循环 损失:{loss.item()} 信噪比:{psnr.item()}") # 回头打印循环信息
         """
             print(expname,i,psnr.numpy(),loss.numpy(),global_step.numpy())
             print('iter time {:.05f}'.format(dt))
             with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
                 tf.contrib.summary.scalar('loss',loss)
                 tf.contrib.summary.scalar('psnr',psnr)
-                tf.contrib.summary.histogram('tran',trans)
+                # tf.contrib.summary.histogram('tran',trans)
                 if args.N_importance > 0:
                     tf.contrib.summary.scalar('psnr0',psnr0)
             if i % args.i_img == 0: # 按频率在tensorboard绘制图像
