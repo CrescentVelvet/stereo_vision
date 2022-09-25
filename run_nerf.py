@@ -497,6 +497,9 @@ def create_nerf(args):
 # 模型训练函数
 def train():
     print('~~~训练函数开始~~~')
+    img2mse = lambda x,y : torch.mean((x-y)**2) # MSE均方误差损失函数
+    mse2psnr = lambda x : -10.0*torch.log(x)/torch.log(torch.Tensor([10.0])) # PSNR信噪比函数
+    to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
     parser = config_parser() # 设置参数
     args = parser.parse_args() # 读取参数
     K = None
@@ -625,9 +628,6 @@ def train():
                                      retraw=True,
                                      **render_kwargs_train)
         # print('>>>第四步,误差传播')
-        img2mse = lambda x,y : torch.mean((x-y)**2) # MSE均方误差损失函数
-        mse2psnr = lambda x : -10.0*torch.log(x)/torch.log(torch.Tensor([10.0])) # PSNR信噪比函数
-        to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
         optimizer.zero_grad() # 清空优化器历史梯度
         img_loss = img2mse(rgb,target_s) # 计算MSE均方误差损失
         psnr = mse2psnr(img_loss) # 计算PSNR信噪比
