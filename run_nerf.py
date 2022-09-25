@@ -12,6 +12,9 @@ import load_data
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # 设备使用GPU或CPU
 np.random.seed(0) # 生成随机数种子
 DEBUG = False # 调试符号
+img2mse = lambda x,y : torch.mean((x-y)**2) # MSE均方误差损失函数
+mse2psnr = lambda x : -10.0*torch.log(x)/torch.log(torch.Tensor([10.0])) # PSNR信噪比函数
+to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
 # 参数设置函数
 def config_parser():
     parser = configargparse.ArgumentParser() # 设置参数
@@ -497,9 +500,6 @@ def create_nerf(args):
 # 模型训练函数
 def train():
     print('~~~训练函数开始~~~')
-    img2mse = lambda x,y : torch.mean((x-y)**2) # MSE均方误差损失函数
-    mse2psnr = lambda x : -10.0*torch.log(x)/torch.log(torch.Tensor([10.0])) # PSNR信噪比函数
-    to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8) # 
     parser = config_parser() # 设置参数
     args = parser.parse_args() # 读取参数
     K = None
