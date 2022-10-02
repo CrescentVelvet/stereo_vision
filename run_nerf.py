@@ -22,7 +22,7 @@ def config_parser():
     parser.add_argument('--config',is_config_file=True,help='config file path') # 生成config.txt文件
     parser.add_argument('--expname',type=str,help='experiment name') # 指定项目名称
     parser.add_argument('--basedir',type=str,default='./logs/',help='where to store ckpts and logs') # 指定结果存储目录
-    parser.add_argument('--datadir',type=str,default='./data/llff/fern',help='input data directory') # 指定数据集目录
+    parser.add_argument('--datadir',type=str,default='/data/nerf_synthetic/lego',help='input data directory') # 指定数据集目录
     # 训练参数
     parser.add_argument('--netdepth',type=int,default=8,help='layers in network') # 设置网络深度,即网络层数
     parser.add_argument('--netwidth',type=int,default=256,help='channels per layer') # 设置网络宽度,即每一层神经元个数
